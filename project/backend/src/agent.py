@@ -1,620 +1,913 @@
-"""UCS Graph-Search agent for Emergency Control.
+"""Emergency Control — UCS agent planner.
 
-The search model is deliberately independent from the frontend contract.
-Internal actions are translated to MOVE/PICKUP/DROP/INTERACT only at the end.
+Implements the state model, transition rules and UCS search described in design.md
+and emits only operations accepted by CONTRATO.md.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import heapq
-from itertools import count
-from typing import Any, Iterable
+from collections import Counter
+from typing import Any, Optional
+
+
+@dataclass(frozen=True)
+class WorldSignature:
+    zone: str
+    inv_keys: tuple[str, ...]
+    inv_tools: tuple[str, ...]
+    inv_materials: tuple[tuple[str, int], ...]
+    ground_keys: tuple[tuple[str, str], ...]
+    ground_tools: tuple[tuple[str, str], ...]
+    ground_materials: tuple[tuple[str, str, int], ...]
+    open_doors: frozenset[str]
+    repaired_panels: frozenset[str]
+    online_stations: frozenset[str]
 
 
 @dataclass(frozen=True)
 class State:
     zone: str
     battery: int
-    keys: tuple[str, ...]
-    tools: tuple[str, ...]
-    materials: tuple[tuple[str, int], ...]
+    inv_keys: tuple[str, ...]
+    inv_tools: tuple[str, ...]
+    inv_materials: tuple[tuple[str, int], ...]
     ground_keys: tuple[tuple[str, str], ...]
     ground_tools: tuple[tuple[str, str], ...]
     ground_materials: tuple[tuple[str, str, int], ...]
-    doors_open: tuple[str, ...]
-    panels_ok: tuple[str, ...]
-    stations_online: tuple[str, ...]
+    open_doors: frozenset[str]
+    repaired_panels: frozenset[str]
+    online_stations: frozenset[str]
 
-    def world_signature(self) -> tuple[Any, ...]:
-        """World configuration without battery, for resource dominance."""
-        return (
-            self.zone,
-            self.keys,
-            self.tools,
-            self.materials,
-            self.ground_keys,
-            self.ground_tools,
-            self.ground_materials,
-            self.doors_open,
-            self.panels_ok,
-            self.stations_online,
+    @property
+    def signature(self) -> WorldSignature:
+        """Same physical world, ignoring battery for dominance checks."""
+        return WorldSignature(
+            zone=self.zone,
+            inv_keys=self.inv_keys,
+            inv_tools=self.inv_tools,
+            inv_materials=self.inv_materials,
+            ground_keys=self.ground_keys,
+            ground_tools=self.ground_tools,
+            ground_materials=self.ground_materials,
+            open_doors=self.open_doors,
+            repaired_panels=self.repaired_panels,
+            online_stations=self.online_stations,
         )
 
 
 @dataclass
-class Node:
+class SearchNode:
     state: State
     g: int
-    parent: "Node | None"
-    action: tuple[Any, ...] | None
-
-
-def _sorted_dict_items(d: dict[str, str]) -> tuple[tuple[str, str], ...]:
-    return tuple(sorted(d.items()))
-
-
-def _material_tuple(d: dict[str, tuple[str, int]]) -> tuple[tuple[str, str, int], ...]:
-    return tuple(sorted((typ, zone, count) for typ, (zone, count) in d.items() if count > 0))
-
-
-def _inv_material_tuple(d: dict[str, int]) -> tuple[tuple[str, int], ...]:
-    return tuple(sorted((typ, count) for typ, count in d.items() if count > 0))
-
-
-def initial_state(scenario: dict[str, Any]) -> State:
-    raw = State(
-        zone=scenario["robot"]["start"],
-        battery=int(scenario["robot"]["battery_start"]),
-        keys=(),
-        tools=(),
-        materials=(),
-        ground_keys=tuple(sorted((k["id"], k["zone"]) for k in scenario.get("keys", []))),
-        ground_tools=tuple(sorted((t["id"], t["zone"]) for t in scenario.get("tools", []))),
-        ground_materials=tuple(
-            sorted((m["type"], m["zone"], int(m.get("count", 0)))
-                   for m in scenario.get("materials", []) if int(m.get("count", 0)) > 0)
-        ),
-        doors_open=tuple(sorted(d["id"] for d in scenario.get("doors", []) if d.get("state") == "OPEN")),
-        panels_ok=tuple(sorted(p["id"] for p in scenario.get("panels", []) if p.get("state") == "OK")),
-        stations_online=tuple(
-            sorted(s["id"] for s in scenario.get("stations", []) if s.get("state") == "ONLINE")
-        ),
-    )
-    return normalize_state(scenario, raw)
-
-
-def _key_map(s: State) -> dict[str, str]:
-    return dict(s.ground_keys)
-
-
-def _tool_map(s: State) -> dict[str, str]:
-    return dict(s.ground_tools)
-
-
-def _material_ground_map(s: State) -> dict[str, tuple[str, int]]:
-    return {typ: (zone, count) for typ, zone, count in s.ground_materials}
-
-
-def _material_inventory(s: State) -> dict[str, int]:
-    return dict(s.materials)
-
-
-def _key_weight(scenario: dict[str, Any], key_id: str) -> int:
-    return int(next(k for k in scenario["keys"] if k["id"] == key_id).get("weight", 1))
-
-
-def _tool_weight(scenario: dict[str, Any], tool_id: str) -> int:
-    return int(next(t for t in scenario["tools"] if t["id"] == tool_id).get("weight", 1))
-
-
-def _material_weight(scenario: dict[str, Any], typ: str) -> int:
-    return int(next(m for m in scenario["materials"] if m["type"] == typ).get("weight", 1))
-
-
-def payload_weight(scenario: dict[str, Any], s: State) -> int:
-    return (
-        sum(_key_weight(scenario, k) for k in s.keys)
-        + sum(_tool_weight(scenario, t) for t in s.tools)
-        + sum(_material_weight(scenario, typ) * n for typ, n in s.materials)
-    )
-
-
-def _costs(scenario: dict[str, Any]) -> dict[str, int]:
-    c = scenario.get("action_costs", {})
-    return {
-        "pickup": int(c.get("pickup", 1)),
-        "drop": int(c.get("drop", 1)),
-        "interact": int(c.get("interact", 2)),
-        "recharge": int(c.get("recharge", 3)),
-    }
-
-
-def _corridor(scenario: dict[str, Any], a: str, b: str) -> dict[str, Any] | None:
-    return next((c for c in scenario.get("corridors", [])
-                 if c["from"] == a and c["to"] == b), None)
-
-
-def _door(scenario: dict[str, Any], door_id: str) -> dict[str, Any]:
-    return next(d for d in scenario["doors"] if d["id"] == door_id)
-
-
-def _panel(scenario: dict[str, Any], panel_id: str) -> dict[str, Any]:
-    return next(p for p in scenario["panels"] if p["id"] == panel_id)
-
-
-def _station(scenario: dict[str, Any], station_id: str) -> dict[str, Any]:
-    return next(s for s in scenario["stations"] if s["id"] == station_id)
-
-
-def _remaining_material_demand(scenario: dict[str, Any], s: State) -> dict[str, int]:
-    demand: dict[str, int] = {}
-    repaired = set(s.panels_ok)
-    for p in scenario.get("panels", []):
-        if p["id"] not in repaired:
-            typ = p["requires"]["material"]
-            demand[typ] = demand.get(typ, 0) + 1
-    inv = _material_inventory(s)
-    for typ, amount in inv.items():
-        demand[typ] = max(0, demand.get(typ, 0) - amount)
-    return demand
-
-
-def _is_relevant_key(scenario: dict[str, Any], s: State, key_id: str) -> bool:
-    return any(d["key"] == key_id and d["id"] not in s.doors_open for d in scenario.get("doors", []))
-
-
-def _is_relevant_tool(scenario: dict[str, Any], s: State, tool_id: str) -> bool:
-    return any(
-        p["requires"]["tool"] == tool_id and p["id"] not in s.panels_ok
-        for p in scenario.get("panels", [])
-    )
-
-
-def _is_relevant_material(scenario: dict[str, Any], s: State, typ: str) -> bool:
-    return _remaining_material_demand(scenario, s).get(typ, 0) > 0
-
-
-def _inventory_has_key(s: State, key_id: str) -> bool:
-    return key_id in s.keys
-
-
-def _inventory_has_tool(s: State, tool_id: str) -> bool:
-    return tool_id in s.tools
-
-
-def _inventory_has_material(s: State, typ: str) -> bool:
-    return dict(s.materials).get(typ, 0) > 0
-
-
-def _replace_key_ground(s: State, values: dict[str, str]) -> State:
-    return State(
-        s.zone, s.battery, s.keys, s.tools, s.materials,
-        _sorted_dict_items(values), s.ground_tools, s.ground_materials,
-        s.doors_open, s.panels_ok, s.stations_online,
-    )
-
-
-def _replace_tool_ground(s: State, values: dict[str, str]) -> State:
-    return State(
-        s.zone, s.battery, s.keys, s.tools, s.materials,
-        s.ground_keys, _sorted_dict_items(values), s.ground_materials,
-        s.doors_open, s.panels_ok, s.stations_online,
-    )
-
-
-def _replace_materials_ground(s: State, values: dict[str, tuple[str, int]]) -> State:
-    return State(
-        s.zone, s.battery, s.keys, s.tools, s.materials,
-        s.ground_keys, s.ground_tools, _material_tuple(values),
-        s.doors_open, s.panels_ok, s.stations_online,
-    )
-
-
-def _with(
-    s: State,
-    *,
-    zone: str | None = None,
-    battery: int | None = None,
-    keys: Iterable[str] | None = None,
-    tools: Iterable[str] | None = None,
-    materials: dict[str, int] | None = None,
-    ground_keys: dict[str, str] | None = None,
-    ground_tools: dict[str, str] | None = None,
-    ground_materials: dict[str, tuple[str, int]] | None = None,
-    doors_open: Iterable[str] | None = None,
-    panels_ok: Iterable[str] | None = None,
-    stations_online: Iterable[str] | None = None,
-) -> State:
-    return State(
-        s.zone if zone is None else zone,
-        s.battery if battery is None else battery,
-        tuple(sorted(s.keys if keys is None else keys)),
-        tuple(sorted(s.tools if tools is None else tools)),
-        s.materials if materials is None else _inv_material_tuple(materials),
-        s.ground_keys if ground_keys is None else _sorted_dict_items(ground_keys),
-        s.ground_tools if ground_tools is None else _sorted_dict_items(ground_tools),
-        s.ground_materials if ground_materials is None else _material_tuple(ground_materials),
-        tuple(sorted(s.doors_open if doors_open is None else doors_open)),
-        tuple(sorted(s.panels_ok if panels_ok is None else panels_ok)),
-        tuple(sorted(s.stations_online if stations_online is None else stations_online)),
-    )
-
-
-
-def normalize_state(scenario: dict[str, Any], s: State) -> State:
-    """Remove ground objects that can no longer affect any future action.
-
-    They remain physically irrelevant to the planner: Applicable never picks
-    them again, so their exact location need not enlarge the search state.
-    """
-    gk = {k: z for k, z in s.ground_keys if _is_relevant_key(scenario, s, k)}
-    gt = {t: z for t, z in s.ground_tools if _is_relevant_tool(scenario, s, t)}
-    demand = _remaining_material_demand(scenario, s)
-    gm = {
-        typ: (z, min(count, demand.get(typ, 0)))
-        for typ, z, count in s.ground_materials
-        if count > 0 and demand.get(typ, 0) > 0
-    }
-    return _with(s, ground_keys=gk, ground_tools=gt, ground_materials=gm)
-
-
-def applicable(scenario: dict[str, Any], s: State) -> list[tuple[Any, ...]]:
-    """Generate only useful successors; this is the agent's Applicable(s)."""
-    c = _costs(scenario)
-    actions: list[tuple[Any, ...]] = []
-
-    # MOVE
-    for corridor in scenario.get("corridors", []):
-        if corridor["from"] != s.zone:
-            continue
-        cost = int(corridor["cost"])
-        if s.battery < cost:
-            continue
-        door_id = corridor.get("door")
-        if door_id and door_id not in s.doors_open:
-            continue
-        actions.append(("MOVE", corridor["to"], cost))
-
-    # PICKUP: keys/tools/materials only if they can still contribute.
-    cap = int(scenario["robot"]["cargo_capacity"])
-    current_weight = payload_weight(scenario, s)
-
-    for item, zone in s.ground_keys:
-        if zone == s.zone and _is_relevant_key(scenario, s, item):
-            w = _key_weight(scenario, item)
-            if current_weight + w <= cap and s.battery >= c["pickup"]:
-                actions.append(("PICKUP", item, c["pickup"]))
-
-    for item, zone in s.ground_tools:
-        if zone == s.zone and _is_relevant_tool(scenario, s, item):
-            w = _tool_weight(scenario, item)
-            if current_weight + w <= cap and s.battery >= c["pickup"]:
-                actions.append(("PICKUP", item, c["pickup"]))
-
-    demand = _remaining_material_demand(scenario, s)
-    inv_mats = _material_inventory(s)
-    for typ, zone, count in s.ground_materials:
-        if zone == s.zone and count > 0 and demand.get(typ, 0) > 0:
-            # Never collect more than the currently pending repair demand.
-            if current_weight + _material_weight(scenario, typ) <= cap and s.battery >= c["pickup"]:
-                actions.append(("PICKUP", typ, c["pickup"]))
-
-    # DROP only when a useful pickup at this zone is blocked by capacity.
-    useful_ground: list[tuple[str, int]] = []
-    for item, zone in s.ground_keys:
-        if zone == s.zone and _is_relevant_key(scenario, s, item):
-            useful_ground.append((item, _key_weight(scenario, item)))
-    for item, zone in s.ground_tools:
-        if zone == s.zone and _is_relevant_tool(scenario, s, item):
-            useful_ground.append((item, _tool_weight(scenario, item)))
-    for typ, zone, count in s.ground_materials:
-        if zone == s.zone and count > 0 and demand.get(typ, 0) > 0:
-            useful_ground.append((typ, _material_weight(scenario, typ)))
-
-    blocked = [(name, weight) for name, weight in useful_ground if current_weight + weight > cap]
-    if blocked and s.battery >= c["drop"]:
-        required_free = min(weight for _, weight in blocked)
-        # Any inventory item that can free enough capacity is a legitimate
-        # decision; items that free less than required are not successors.
-        candidates: list[tuple[str, int, bool]] = []
-        for key in s.keys:
-            w = _key_weight(scenario, key)
-            candidates.append((key, w, not _is_relevant_key(scenario, s, key)))
-        for tool in s.tools:
-            w = _tool_weight(scenario, tool)
-            candidates.append((tool, w, not _is_relevant_tool(scenario, s, tool)))
-        for typ, amount in s.materials:
-            if amount > 0:
-                w = _material_weight(scenario, typ)
-                candidates.append((typ, w, not _is_relevant_material(scenario, s, typ)))
-
-        # If an inventory object has become permanently useless, an optimal
-        # plan never needs to carry it farther just to drop a different useful
-        # object. Prefer these safe releases first; only when none exists do
-        # we retain alternatives among still-useful resources.
-        safe = [x for x in candidates if x[2] and x[1] >= required_free]
-        pool = safe if safe else [x for x in candidates if x[1] >= required_free]
-        for name, _weight, _irrelevant in pool:
-            actions.append(("DROP", name, c["drop"]))
-
-    # OPEN_DOOR
-    if s.battery >= c["interact"]:
-        for d in scenario.get("doors", []):
-            if d["id"] in s.doors_open:
-                continue
-            if s.zone in d["between"] and _inventory_has_key(s, d["key"]):
-                actions.append(("OPEN_DOOR", d["id"], c["interact"]))
-
-    # REPAIR
-    if s.battery >= c["interact"]:
-        for p in scenario.get("panels", []):
-            if p["id"] in s.panels_ok or p["zone"] != s.zone:
-                continue
-            req = p["requires"]
-            if _inventory_has_tool(s, req["tool"]) and _inventory_has_material(s, req["material"]):
-                actions.append(("REPAIR", p["id"], req["material"], c["interact"]))
-
-    # ACTIVATE
-    if s.battery >= c["interact"]:
-        online = set(s.stations_online)
-        repaired = set(s.panels_ok)
-        for st in scenario.get("stations", []):
-            if st["id"] in online or st["zone"] != s.zone:
-                continue
-            req = st.get("requires", {})
-            if not set(req.get("panels_ok", [])).issubset(repaired):
-                continue
-            if not set(req.get("stations_online", [])).issubset(online):
-                continue
-            actions.append(("ACTIVATE", st["id"], c["interact"]))
-
-    # RECHARGE. The cost is paid before battery becomes full.
-    if s.battery < int(scenario["robot"]["battery_max"]) and s.battery >= c["recharge"]:
-        charger_zones = {ch["zone"] for ch in scenario.get("chargers", [])}
-        if s.zone in charger_zones:
-            for ch in scenario.get("chargers", []):
-                if ch["zone"] == s.zone:
-                    actions.append(("RECHARGE", ch["id"], c["recharge"]))
-
-    return actions
-
-
-def _transition_raw(scenario: dict[str, Any], s: State, action: tuple[Any, ...]) -> State:
-    kind = action[0]
-    cost = int(action[-1])
-    if s.battery < cost:
-        raise ValueError("battery insufficient")
-
-    if kind == "MOVE":
-        _, destination, _ = action
-        return _with(s, zone=destination, battery=s.battery - cost)
-
-    if kind == "PICKUP":
-        _, item, _ = action
-        battery = s.battery - cost
-        keys = list(s.keys)
-        tools = list(s.tools)
-        mats = _material_inventory(s)
-        gk, gt, gm = _key_map(s), _tool_map(s), _material_ground_map(s)
-
-        if item in gk:
-            del gk[item]
-            keys.append(item)
-        elif item in gt:
-            del gt[item]
-            tools.append(item)
-        elif item in gm:
-            zone, count = gm[item]
-            if count <= 1:
-                del gm[item]
-            else:
-                gm[item] = (zone, count - 1)
-            mats[item] = mats.get(item, 0) + 1
-        else:
-            raise ValueError(f"pickup item not found: {item}")
-
-        return _with(
-            s, battery=battery, keys=keys, tools=tools, materials=mats,
-            ground_keys=gk, ground_tools=gt, ground_materials=gm
+    parent: Optional["SearchNode"] = None
+    step: Optional[dict[str, Any]] = None
+
+
+class DominanceTracker:
+    """Non-dominated (battery, g) pairs for each battery-free world signature."""
+
+    def __init__(self) -> None:
+        self.frontiers: dict[WorldSignature, list[tuple[int, int]]] = {}
+
+    def is_dominated(self, signature: WorldSignature, battery: int, g: int) -> bool:
+        for old_battery, old_g in self.frontiers.get(signature, []):
+            if old_battery >= battery and old_g <= g:
+                return True
+        return False
+
+    def add(self, signature: WorldSignature, battery: int, g: int) -> None:
+        frontier = self.frontiers.setdefault(signature, [])
+        frontier[:] = [
+            (old_battery, old_g)
+            for old_battery, old_g in frontier
+            if not (battery >= old_battery and g <= old_g)
+        ]
+        frontier.append((battery, g))
+
+    def is_current(self, signature: WorldSignature, battery: int, g: int) -> bool:
+        """False when this heap entry was later dominated by a better arrival."""
+        return (battery, g) in self.frontiers.get(signature, [])
+
+
+class ScenarioProblem:
+    def __init__(self, scenario: dict[str, Any]) -> None:
+        self.scenario = scenario
+        self.robot = scenario["robot"]
+
+        self.battery_max = int(self.robot["battery_max"])
+        self.cargo_capacity = int(self.robot["cargo_capacity"])
+
+        costs = scenario.get("action_costs", {})
+        self.pickup_cost = int(costs["pickup"])
+        self.drop_cost = int(costs["drop"])
+        self.interact_cost = int(costs["interact"])
+        self.recharge_cost = int(costs["recharge"])
+
+        self.keys = scenario.get("keys", [])
+        self.tools = scenario.get("tools", [])
+        self.materials = scenario.get("materials", [])
+        self.doors = scenario.get("doors", [])
+        self.panels = scenario.get("panels", [])
+        self.stations = scenario.get("stations", [])
+        self.chargers = scenario.get("chargers", [])
+        self.zones = scenario.get("zones", [])
+
+        self.goal_stations = frozenset(
+            scenario.get("goal", {}).get("stations_online", [])
         )
 
-    if kind == "DROP":
-        _, item, _ = action
-        battery = s.battery - cost
-        keys = list(s.keys)
-        tools = list(s.tools)
-        mats = _material_inventory(s)
-        gk, gt, gm = _key_map(s), _tool_map(s), _material_ground_map(s)
-
-        if item in keys:
-            keys.remove(item)
-            gk[item] = s.zone
-        elif item in tools:
-            tools.remove(item)
-            gt[item] = s.zone
-        elif mats.get(item, 0) > 0:
-            mats[item] -= 1
-            if mats[item] == 0:
-                del mats[item]
-            if item in gm and gm[item][0] == s.zone:
-                gm[item] = (s.zone, gm[item][1] + 1)
-            else:
-                gm[item] = (s.zone, 1)
-        else:
-            raise ValueError(f"drop item not in inventory: {item}")
-
-        return _with(
-            s, battery=battery, keys=keys, tools=tools, materials=mats,
-            ground_keys=gk, ground_tools=gt, ground_materials=gm
-        )
-
-    if kind == "OPEN_DOOR":
-        _, door_id, _ = action
-        return _with(
-            s, battery=s.battery - cost,
-            doors_open=set(s.doors_open) | {door_id}
-        )
-
-    if kind == "REPAIR":
-        _, panel_id, material, _ = action
-        mats = _material_inventory(s)
-        mats[material] -= 1
-        if mats[material] == 0:
-            del mats[material]
-        return _with(
-            s, battery=s.battery - cost, materials=mats,
-            panels_ok=set(s.panels_ok) | {panel_id}
-        )
-
-    if kind == "ACTIVATE":
-        _, station_id, _ = action
-        return _with(
-            s, battery=s.battery - cost,
-            stations_online=set(s.stations_online) | {station_id}
-        )
-
-    if kind == "RECHARGE":
-        _, _charger_id, _ = action
-        return _with(s, battery=int(scenario["robot"]["battery_max"]))
-
-    raise ValueError(f"unknown action {kind}")
-
-
-
-def transition(scenario: dict[str, Any], s: State, action: tuple[Any, ...]) -> State:
-    return normalize_state(scenario, _transition_raw(scenario, s, action))
-
-def is_goal(scenario: dict[str, Any], s: State) -> bool:
-    return set(scenario["goal"]["stations_online"]).issubset(set(s.stations_online))
-
-
-def _dominates(a: tuple[int, int], b: tuple[int, int]) -> bool:
-    return a[0] >= b[0] and a[1] <= b[1]
-
-
-def _reconstruct(node: Node) -> list[tuple[Any, ...]]:
-    actions: list[tuple[Any, ...]] = []
-    while node.parent is not None:
-        assert node.action is not None
-        actions.append(node.action)
-        node = node.parent
-    actions.reverse()
-    return actions
-
-
-def _action_to_plan(scenario: dict[str, Any], action: tuple[Any, ...], state: State) -> dict[str, Any]:
-    kind = action[0]
-    cost = int(action[-1])
-    if kind == "MOVE":
-        return {"op": "MOVE", "from": state.zone, "to": action[1], "cost": cost}
-    if kind == "PICKUP":
-        return {"op": "PICKUP", "item": action[1], "cost": cost}
-    if kind == "DROP":
-        return {"op": "DROP", "item": action[1], "cost": cost}
-    if kind == "OPEN_DOOR":
-        return {"op": "INTERACT", "target": action[1], "action": "OPEN_DOOR", "cost": cost}
-    if kind == "REPAIR":
-        return {
-            "op": "INTERACT", "target": action[1], "action": "REPAIR",
-            "consumes": action[2], "cost": cost
+        self.key_weights = {
+            item["id"]: int(item.get("weight", 1)) for item in self.keys
         }
-    if kind == "ACTIVATE":
-        return {"op": "INTERACT", "target": action[1], "action": "ACTIVATE", "cost": cost}
-    if kind == "RECHARGE":
-        return {"op": "INTERACT", "target": action[1], "action": "RECHARGE", "cost": cost}
-    raise ValueError(kind)
+        self.tool_weights = {
+            item["id"]: int(item.get("weight", 1)) for item in self.tools
+        }
+        self.material_weights = {
+            item["type"]: int(item.get("weight", 1)) for item in self.materials
+        }
+
+        self.corridors_by_from: dict[str, list[dict[str, Any]]] = {}
+        for corridor in scenario.get("corridors", []):
+            self.corridors_by_from.setdefault(corridor["from"], []).append(corridor)
+
+    # ------------------------------------------------------------------
+    # State helpers
+    # ------------------------------------------------------------------
+
+    def initial_state(self) -> State:
+        ground_keys = tuple(
+            sorted((item["id"], item["zone"]) for item in self.keys)
+        )
+        ground_tools = tuple(
+            sorted((item["id"], item["zone"]) for item in self.tools)
+        )
+
+        # Aggregate equivalent materials by (zone, type).
+        material_counts: Counter[tuple[str, str]] = Counter()
+        for item in self.materials:
+            count = int(item.get("count", 0))
+            if count > 0:
+                material_counts[(item["zone"], item["type"])] += count
+
+        ground_materials = tuple(
+            sorted(
+                (zone, material_type, count)
+                for (zone, material_type), count in material_counts.items()
+                if count > 0
+            )
+        )
+
+        state = State(
+            zone=self.robot["start"],
+            battery=int(self.robot["battery_start"]),
+            inv_keys=(),
+            inv_tools=(),
+            inv_materials=(),
+            ground_keys=ground_keys,
+            ground_tools=ground_tools,
+            ground_materials=ground_materials,
+            open_doors=frozenset(
+                door["id"]
+                for door in self.doors
+                if door.get("state") == "OPEN"
+            ),
+            repaired_panels=frozenset(
+                panel["id"]
+                for panel in self.panels
+                if panel.get("state") in {"OK", "REPAIRED"}
+            ),
+            online_stations=frozenset(
+                station["id"]
+                for station in self.stations
+                if station.get("state") == "ONLINE"
+            ),
+        )
+        return self.canonicalize(state)
+
+    def is_goal(self, state: State) -> bool:
+        return self.goal_stations.issubset(state.online_stations)
+
+    def item_weight(self, item: str) -> int:
+        if item in self.key_weights:
+            return self.key_weights[item]
+        if item in self.tool_weights:
+            return self.tool_weights[item]
+        return self.material_weights.get(item, 1)
+
+    def payload_weight(self, state: State) -> int:
+        total = sum(self.key_weights.get(item, 1) for item in state.inv_keys)
+        total += sum(self.tool_weights.get(item, 1) for item in state.inv_tools)
+        total += sum(
+            self.material_weights.get(material_type, 1) * count
+            for material_type, count in state.inv_materials
+        )
+        return total
+
+    def pending_material_demand(self, state: State) -> Counter[str]:
+        return Counter(
+            panel["requires"]["material"]
+            for panel in self.panels
+            if panel["id"] not in state.repaired_panels
+        )
+
+    def key_is_relevant(self, key_id: str, state: State) -> bool:
+        return any(
+            door["key"] == key_id and door["id"] not in state.open_doors
+            for door in self.doors
+        )
+
+    def tool_is_relevant(self, tool_id: str, state: State) -> bool:
+        return any(
+            panel["requires"]["tool"] == tool_id
+            and panel["id"] not in state.repaired_panels
+            for panel in self.panels
+        )
+
+    def material_pickup_is_relevant(self, material_type: str, state: State) -> bool:
+        needed = self.pending_material_demand(state)[material_type]
+        carried = dict(state.inv_materials).get(material_type, 0)
+        return carried < needed
+
+    def canonicalize(self, state: State) -> State:
+        """Remove ground information that can no longer affect the future.
+
+        Objects still carried are kept because they continue to occupy capacity.
+        Once an object is both irrelevant and outside the payload, its exact
+        ground position is intentionally ignored.
+        """
+
+        ground_keys = tuple(
+            sorted(
+                (item, zone)
+                for item, zone in state.ground_keys
+                if self.key_is_relevant(item, state)
+            )
+        )
+
+        ground_tools = tuple(
+            sorted(
+                (item, zone)
+                for item, zone in state.ground_tools
+                if self.tool_is_relevant(item, state)
+            )
+        )
+
+        pending_materials = set(self.pending_material_demand(state))
+        material_counts: Counter[tuple[str, str]] = Counter()
+        for zone, material_type, count in state.ground_materials:
+            if material_type in pending_materials and count > 0:
+                material_counts[(zone, material_type)] += count
+
+        ground_materials = tuple(
+            sorted(
+                (zone, material_type, count)
+                for (zone, material_type), count in material_counts.items()
+                if count > 0
+            )
+        )
+
+        return State(
+            zone=state.zone,
+            battery=state.battery,
+            inv_keys=tuple(sorted(state.inv_keys)),
+            inv_tools=tuple(sorted(state.inv_tools)),
+            inv_materials=tuple(
+                sorted((material_type, count)
+                       for material_type, count in state.inv_materials
+                       if count > 0)
+            ),
+            ground_keys=ground_keys,
+            ground_tools=ground_tools,
+            ground_materials=ground_materials,
+            open_doors=frozenset(state.open_doors),
+            repaired_panels=frozenset(state.repaired_panels),
+            online_stations=frozenset(state.online_stations),
+        )
+
+    # ------------------------------------------------------------------
+    # DROP pruning
+    # ------------------------------------------------------------------
+
+    def capacity_blocks_relevant_pickup(self, state: State) -> bool:
+        current_weight = self.payload_weight(state)
+
+        for item, zone in state.ground_keys:
+            if (
+                zone == state.zone
+                and self.key_is_relevant(item, state)
+                and current_weight + self.item_weight(item) > self.cargo_capacity
+            ):
+                return True
+
+        for item, zone in state.ground_tools:
+            if (
+                zone == state.zone
+                and self.tool_is_relevant(item, state)
+                and current_weight + self.item_weight(item) > self.cargo_capacity
+            ):
+                return True
+
+        for zone, material_type, count in state.ground_materials:
+            if (
+                zone == state.zone
+                and count > 0
+                and self.material_pickup_is_relevant(material_type, state)
+                and current_weight + self.item_weight(material_type)
+                > self.cargo_capacity
+            ):
+                return True
+
+        return False
+
+    def dead_carried_items(self, state: State) -> set[str]:
+        """Items that no longer enable any pending future operation."""
+        dead: set[str] = set()
+
+        for item in state.inv_keys:
+            if not self.key_is_relevant(item, state):
+                dead.add(item)
+
+        for item in state.inv_tools:
+            if not self.tool_is_relevant(item, state):
+                dead.add(item)
+
+        pending = self.pending_material_demand(state)
+        for material_type, _count in state.inv_materials:
+            if pending[material_type] == 0:
+                dead.add(material_type)
+
+        return dead
+
+    # ------------------------------------------------------------------
+    # Successors
+    # ------------------------------------------------------------------
+
+    def successors(
+        self,
+        state: State,
+        *,
+        drop_mode: str = "full",
+    ) -> list[tuple[State, int, dict[str, Any]]]:
+        successors: list[tuple[State, int, dict[str, Any]]] = []
+        current_weight = self.payload_weight(state)
+
+        def add(next_state: State, cost: int, step: dict[str, Any]) -> None:
+            successors.append((self.canonicalize(next_state), cost, step))
+
+        # RECHARGE
+        if state.battery < self.battery_max and state.battery >= self.recharge_cost:
+            for charger in self.chargers:
+                if charger.get("zone") != state.zone:
+                    continue
+
+                add(
+                    State(
+                        zone=state.zone,
+                        battery=self.battery_max,
+                        inv_keys=state.inv_keys,
+                        inv_tools=state.inv_tools,
+                        inv_materials=state.inv_materials,
+                        ground_keys=state.ground_keys,
+                        ground_tools=state.ground_tools,
+                        ground_materials=state.ground_materials,
+                        open_doors=state.open_doors,
+                        repaired_panels=state.repaired_panels,
+                        online_stations=state.online_stations,
+                    ),
+                    self.recharge_cost,
+                    {
+                        "op": "INTERACT",
+                        "target": charger["id"],
+                        "action": "RECHARGE",
+                        "cost": self.recharge_cost,
+                    },
+                )
+
+        # OPEN_DOOR
+        if state.battery >= self.interact_cost:
+            for door in self.doors:
+                if (
+                    door["id"] not in state.open_doors
+                    and state.zone in door.get("between", [])
+                    and door["key"] in state.inv_keys
+                ):
+                    add(
+                        State(
+                            zone=state.zone,
+                            battery=state.battery - self.interact_cost,
+                            inv_keys=state.inv_keys,
+                            inv_tools=state.inv_tools,
+                            inv_materials=state.inv_materials,
+                            ground_keys=state.ground_keys,
+                            ground_tools=state.ground_tools,
+                            ground_materials=state.ground_materials,
+                            open_doors=state.open_doors | {door["id"]},
+                            repaired_panels=state.repaired_panels,
+                            online_stations=state.online_stations,
+                        ),
+                        self.interact_cost,
+                        {
+                            "op": "INTERACT",
+                            "target": door["id"],
+                            "action": "OPEN_DOOR",
+                            "cost": self.interact_cost,
+                        },
+                    )
+
+        # REPAIR
+        if state.battery >= self.interact_cost:
+            inv_materials = dict(state.inv_materials)
+
+            for panel in self.panels:
+                if (
+                    panel["id"] in state.repaired_panels
+                    or panel["zone"] != state.zone
+                ):
+                    continue
+
+                tool = panel["requires"]["tool"]
+                material = panel["requires"]["material"]
+
+                if tool not in state.inv_tools or inv_materials.get(material, 0) <= 0:
+                    continue
+
+                new_materials = dict(inv_materials)
+                new_materials[material] -= 1
+                if new_materials[material] == 0:
+                    del new_materials[material]
+
+                add(
+                    State(
+                        zone=state.zone,
+                        battery=state.battery - self.interact_cost,
+                        inv_keys=state.inv_keys,
+                        inv_tools=state.inv_tools,
+                        inv_materials=tuple(sorted(new_materials.items())),
+                        ground_keys=state.ground_keys,
+                        ground_tools=state.ground_tools,
+                        ground_materials=state.ground_materials,
+                        open_doors=state.open_doors,
+                        repaired_panels=state.repaired_panels | {panel["id"]},
+                        online_stations=state.online_stations,
+                    ),
+                    self.interact_cost,
+                    {
+                        "op": "INTERACT",
+                        "target": panel["id"],
+                        "action": "REPAIR",
+                        "consumes": material,
+                        "cost": self.interact_cost,
+                    },
+                )
+
+        # ACTIVATE
+        if state.battery >= self.interact_cost:
+            for station in self.stations:
+                if (
+                    station["id"] in state.online_stations
+                    or station["zone"] != state.zone
+                ):
+                    continue
+
+                requires = station.get("requires", {})
+                panels_ok = all(
+                    panel in state.repaired_panels
+                    for panel in requires.get("panels_ok", [])
+                )
+                stations_ok = all(
+                    other in state.online_stations
+                    for other in requires.get("stations_online", [])
+                )
+
+                if not (panels_ok and stations_ok):
+                    continue
+
+                add(
+                    State(
+                        zone=state.zone,
+                        battery=state.battery - self.interact_cost,
+                        inv_keys=state.inv_keys,
+                        inv_tools=state.inv_tools,
+                        inv_materials=state.inv_materials,
+                        ground_keys=state.ground_keys,
+                        ground_tools=state.ground_tools,
+                        ground_materials=state.ground_materials,
+                        open_doors=state.open_doors,
+                        repaired_panels=state.repaired_panels,
+                        online_stations=state.online_stations | {station["id"]},
+                    ),
+                    self.interact_cost,
+                    {
+                        "op": "INTERACT",
+                        "target": station["id"],
+                        "action": "ACTIVATE",
+                        "cost": self.interact_cost,
+                    },
+                )
+
+        # PICKUP keys
+        if state.battery >= self.pickup_cost:
+            for item, zone in state.ground_keys:
+                if (
+                    zone == state.zone
+                    and self.key_is_relevant(item, state)
+                    and current_weight + self.item_weight(item) <= self.cargo_capacity
+                ):
+                    add(
+                        State(
+                            zone=state.zone,
+                            battery=state.battery - self.pickup_cost,
+                            inv_keys=tuple(sorted(state.inv_keys + (item,))),
+                            inv_tools=state.inv_tools,
+                            inv_materials=state.inv_materials,
+                            ground_keys=tuple(
+                                pair for pair in state.ground_keys if pair[0] != item
+                            ),
+                            ground_tools=state.ground_tools,
+                            ground_materials=state.ground_materials,
+                            open_doors=state.open_doors,
+                            repaired_panels=state.repaired_panels,
+                            online_stations=state.online_stations,
+                        ),
+                        self.pickup_cost,
+                        {"op": "PICKUP", "item": item, "cost": self.pickup_cost},
+                    )
+
+            # PICKUP tools
+            for item, zone in state.ground_tools:
+                if (
+                    zone == state.zone
+                    and self.tool_is_relevant(item, state)
+                    and current_weight + self.item_weight(item) <= self.cargo_capacity
+                ):
+                    add(
+                        State(
+                            zone=state.zone,
+                            battery=state.battery - self.pickup_cost,
+                            inv_keys=state.inv_keys,
+                            inv_tools=tuple(sorted(state.inv_tools + (item,))),
+                            inv_materials=state.inv_materials,
+                            ground_keys=state.ground_keys,
+                            ground_tools=tuple(
+                                pair for pair in state.ground_tools if pair[0] != item
+                            ),
+                            ground_materials=state.ground_materials,
+                            open_doors=state.open_doors,
+                            repaired_panels=state.repaired_panels,
+                            online_stations=state.online_stations,
+                        ),
+                        self.pickup_cost,
+                        {"op": "PICKUP", "item": item, "cost": self.pickup_cost},
+                    )
+
+            # PICKUP materials
+            for zone, material_type, count in state.ground_materials:
+                if (
+                    zone != state.zone
+                    or count <= 0
+                    or not self.material_pickup_is_relevant(material_type, state)
+                    or current_weight + self.item_weight(material_type)
+                    > self.cargo_capacity
+                ):
+                    continue
+
+                inventory = dict(state.inv_materials)
+                inventory[material_type] = inventory.get(material_type, 0) + 1
+
+                new_ground: list[tuple[str, str, int]] = []
+                for ground_zone, ground_type, ground_count in state.ground_materials:
+                    if ground_zone == zone and ground_type == material_type:
+                        if ground_count > 1:
+                            new_ground.append(
+                                (ground_zone, ground_type, ground_count - 1)
+                            )
+                    else:
+                        new_ground.append(
+                            (ground_zone, ground_type, ground_count)
+                        )
+
+                add(
+                    State(
+                        zone=state.zone,
+                        battery=state.battery - self.pickup_cost,
+                        inv_keys=state.inv_keys,
+                        inv_tools=state.inv_tools,
+                        inv_materials=tuple(sorted(inventory.items())),
+                        ground_keys=state.ground_keys,
+                        ground_tools=state.ground_tools,
+                        ground_materials=tuple(sorted(new_ground)),
+                        open_doors=state.open_doors,
+                        repaired_panels=state.repaired_panels,
+                        online_stations=state.online_stations,
+                    ),
+                    self.pickup_cost,
+                    {
+                        "op": "PICKUP",
+                        "item": material_type,
+                        "cost": self.pickup_cost,
+                    },
+                )
+
+        # DROP: only when capacity blocks a relevant pickup.
+        if (
+            state.battery >= self.drop_cost
+            and self.capacity_blocks_relevant_pickup(state)
+        ):
+            allowed_items: Optional[set[str]] = None
+
+            if drop_mode == "dead_only":
+                allowed_items = self.dead_carried_items(state)
+                if not allowed_items:
+                    # Restricted phase intentionally does not branch into live-item
+                    # placements. The general UCS fallback handles those cases.
+                    allowed_items = set()
+
+            # Keys
+            for item in state.inv_keys:
+                if allowed_items is not None and item not in allowed_items:
+                    continue
+
+                add(
+                    State(
+                        zone=state.zone,
+                        battery=state.battery - self.drop_cost,
+                        inv_keys=tuple(k for k in state.inv_keys if k != item),
+                        inv_tools=state.inv_tools,
+                        inv_materials=state.inv_materials,
+                        ground_keys=state.ground_keys + ((item, state.zone),),
+                        ground_tools=state.ground_tools,
+                        ground_materials=state.ground_materials,
+                        open_doors=state.open_doors,
+                        repaired_panels=state.repaired_panels,
+                        online_stations=state.online_stations,
+                    ),
+                    self.drop_cost,
+                    {"op": "DROP", "item": item, "cost": self.drop_cost},
+                )
+
+            # Tools
+            for item in state.inv_tools:
+                if allowed_items is not None and item not in allowed_items:
+                    continue
+
+                add(
+                    State(
+                        zone=state.zone,
+                        battery=state.battery - self.drop_cost,
+                        inv_keys=state.inv_keys,
+                        inv_tools=tuple(t for t in state.inv_tools if t != item),
+                        inv_materials=state.inv_materials,
+                        ground_keys=state.ground_keys,
+                        ground_tools=state.ground_tools + ((item, state.zone),),
+                        ground_materials=state.ground_materials,
+                        open_doors=state.open_doors,
+                        repaired_panels=state.repaired_panels,
+                        online_stations=state.online_stations,
+                    ),
+                    self.drop_cost,
+                    {"op": "DROP", "item": item, "cost": self.drop_cost},
+                )
+
+            # Materials
+            for material_type, count in state.inv_materials:
+                if allowed_items is not None and material_type not in allowed_items:
+                    continue
+
+                inventory = dict(state.inv_materials)
+                if count == 1:
+                    del inventory[material_type]
+                else:
+                    inventory[material_type] = count - 1
+
+                material_ground: Counter[tuple[str, str]] = Counter(
+                    {
+                        (zone, mat_type): ground_count
+                        for zone, mat_type, ground_count in state.ground_materials
+                    }
+                )
+                material_ground[(state.zone, material_type)] += 1
+
+                new_ground = tuple(
+                    sorted(
+                        (zone, mat_type, ground_count)
+                        for (zone, mat_type), ground_count in material_ground.items()
+                        if ground_count > 0
+                    )
+                )
+
+                add(
+                    State(
+                        zone=state.zone,
+                        battery=state.battery - self.drop_cost,
+                        inv_keys=state.inv_keys,
+                        inv_tools=state.inv_tools,
+                        inv_materials=tuple(sorted(inventory.items())),
+                        ground_keys=state.ground_keys,
+                        ground_tools=state.ground_tools,
+                        ground_materials=new_ground,
+                        open_doors=state.open_doors,
+                        repaired_panels=state.repaired_panels,
+                        online_stations=state.online_stations,
+                    ),
+                    self.drop_cost,
+                    {
+                        "op": "DROP",
+                        "item": material_type,
+                        "cost": self.drop_cost,
+                    },
+                )
+
+        # MOVE
+        for corridor in self.corridors_by_from.get(state.zone, []):
+            door = corridor.get("door")
+            cost = int(corridor["cost"])
+
+            if door is not None and door not in state.open_doors:
+                continue
+            if state.battery < cost:
+                continue
+
+            add(
+                State(
+                    zone=corridor["to"],
+                    battery=state.battery - cost,
+                    inv_keys=state.inv_keys,
+                    inv_tools=state.inv_tools,
+                    inv_materials=state.inv_materials,
+                    ground_keys=state.ground_keys,
+                    ground_tools=state.ground_tools,
+                    ground_materials=state.ground_materials,
+                    open_doors=state.open_doors,
+                    repaired_panels=state.repaired_panels,
+                    online_stations=state.online_stations,
+                ),
+                cost,
+                {
+                    "op": "MOVE",
+                    "from": state.zone,
+                    "to": corridor["to"],
+                    "cost": cost,
+                },
+            )
+
+        return successors
 
 
-def solve(scenario: dict[str, Any]) -> dict[str, Any]:
-    """Return an optimal-cost plan using UCS Graph Search."""
-    start = initial_state(scenario)
-    root = Node(start, 0, None, None)
-    frontier: list[tuple[int, int, Node]] = []
-    seq = count()
-    heapq.heappush(frontier, (0, next(seq), root))
+def _reconstruct(node: SearchNode) -> list[dict[str, Any]]:
+    steps: list[dict[str, Any]] = []
+    current: Optional[SearchNode] = node
 
-    # Best exact cost seen for an identical physical state.
-    best_g: dict[State, int] = {start: 0}
+    while current is not None and current.step is not None:
+        steps.append(current.step)
+        current = current.parent
 
-    # Pareto frontier for each world signature: (battery, g).
-    pareto: dict[tuple[Any, ...], list[tuple[int, int]]] = {
-        start.world_signature(): [(start.battery, 0)]
-    }
+    steps.reverse()
+    return steps
+
+
+def _ucs(
+    problem: ScenarioProblem,
+    *,
+    drop_mode: str,
+    expansion_limit: Optional[int] = None,
+) -> Optional[SearchNode]:
+    initial = problem.initial_state()
+
+    if problem.is_goal(initial):
+        return SearchNode(initial, 0)
+
+    tracker = DominanceTracker()
+    closed: set[State] = set()
+
+    frontier: list[tuple[int, int, SearchNode]] = []
+    counter = 0
+
+    root = SearchNode(initial, 0)
+    tracker.add(initial.signature, initial.battery, 0)
+    heapq.heappush(frontier, (0, counter, root))
 
     expanded = 0
 
     while frontier:
         g, _, node = heapq.heappop(frontier)
-        s = node.state
 
-        if g != best_g.get(s):
+        # Heap entries can become stale after a dominating path is discovered.
+        if not tracker.is_current(node.state.signature, node.state.battery, g):
             continue
 
-        # A later-arriving node can be dominated by a cheaper/higher-battery
-        # representative of the same world.
-        pairs = pareto.get(s.world_signature(), [])
-        if any((b, pg) != (s.battery, g) and _dominates((b, pg), (s.battery, g))
-               for b, pg in pairs):
+        if node.state in closed:
             continue
 
-        if is_goal(scenario, s):
-            internal = _reconstruct(node)
-            states = []
-            cur = start
-            for act in internal:
-                states.append(cur)
-                cur = transition(scenario, cur, act)
-            steps = [_action_to_plan(scenario, act, st) for act, st in zip(internal, states)]
-            return {
-                "solution_found": True,
-                "total_cost": g,
-                "steps": steps,
-                "message": f"UCS Graph Search; expanded {expanded} nodes.",
-            }
+        # UCS goal test is performed when the node is extracted.
+        if problem.is_goal(node.state):
+            return node
 
+        closed.add(node.state)
         expanded += 1
 
-        for action in applicable(scenario, s):
-            # Immediate inverse moves/pickup-drop pairs cannot improve a
-            # positive-cost solution: no world-changing action occurs between
-            # them. Avoid generating these two-step detours.
-            if node.action is not None:
-                prev = node.action
-                if prev[0] == "MOVE" and action[0] == "MOVE":
-                    # prev = MOVE(dest), so its origin is node.parent.state.zone.
-                    if node.parent is not None and action[1] == node.parent.state.zone:
-                        continue
-                if prev[0] == "PICKUP" and action[0] == "DROP" and prev[1] == action[1]:
-                    continue
-                if prev[0] == "DROP" and action[0] == "PICKUP" and prev[1] == action[1]:
-                    continue
+        if expansion_limit is not None and expanded >= expansion_limit:
+            return None
 
-            child_state = transition(scenario, s, action)
-            child_g = g + int(action[-1])
-
-            if child_g >= best_g.get(child_state, 10**18):
+        for next_state, action_cost, step in problem.successors(
+            node.state,
+            drop_mode=drop_mode,
+        ):
+            if next_state in closed:
                 continue
 
-            sig = child_state.world_signature()
-            frontier_pairs = pareto.setdefault(sig, [])
-            if any(_dominates((b, pg), (child_state.battery, child_g))
-                   for b, pg in frontier_pairs):
+            next_g = g + action_cost
+
+            if tracker.is_dominated(
+                next_state.signature,
+                next_state.battery,
+                next_g,
+            ):
                 continue
 
-            # Remove old Pareto points dominated by this child.
-            frontier_pairs[:] = [
-                (b, pg) for b, pg in frontier_pairs
-                if not _dominates((child_state.battery, child_g), (b, pg))
-            ]
-            frontier_pairs.append((child_state.battery, child_g))
-            best_g[child_state] = child_g
-            child = Node(child_state, child_g, node, action)
-            heapq.heappush(frontier, (child_g, next(seq), child))
+            tracker.add(
+                next_state.signature,
+                next_state.battery,
+                next_g,
+            )
+
+            counter += 1
+            heapq.heappush(
+                frontier,
+                (
+                    next_g,
+                    counter,
+                    SearchNode(
+                        state=next_state,
+                        g=next_g,
+                        parent=node,
+                        step=step,
+                    ),
+                ),
+            )
+
+    return None
+
+
+def solve_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
+    """Solve a scenario and return the exact API contract shape.
+
+    A relevance-pruned UCS is attempted first because DROP is the dominant
+    branching source. If that restricted search cannot find a plan, the solver
+    falls back to the complete DROP generator.
+    """
+
+    problem = ScenarioProblem(scenario)
+
+    if problem.is_goal(problem.initial_state()):
+        return {
+            "solution_found": True,
+            "total_cost": 0,
+            "steps": [],
+            "message": "Initial state already satisfies goal.",
+        }
+
+    # Fast search: only discard payload objects whose future role is already over.
+    # This is enough for the provided demo and avoids the DROP explosion.
+    node = _ucs(
+        problem,
+        drop_mode="dead_only",
+        expansion_limit=120_000,
+    )
+
+    used_fallback = False
+
+    # General fallback for instances that really require dropping a still-relevant
+    # item to continue.
+    if node is None:
+        used_fallback = True
+        node = _ucs(
+            problem,
+            drop_mode="full",
+            expansion_limit=None,
+        )
+
+    if node is None:
+        return {
+            "solution_found": False,
+            "total_cost": 0,
+            "steps": [],
+            "message": "FAILURE: No valid plan exists to reach the goal.",
+        }
+
+    steps = _reconstruct(node)
+    total_cost = sum(int(step["cost"]) for step in steps)
 
     return {
-        "solution_found": False,
-        "total_cost": 0,
-        "steps": [],
-        "message": f"UCS exhausted the reachable state space; expanded {expanded} nodes.",
+        "solution_found": True,
+        "total_cost": total_cost,
+        "steps": steps,
+        "message": (
+            "Plan found by UCS."
+            if used_fallback
+            else "Plan found by UCS with relevance-pruned DROP."
+        ),
     }
+
+solve = solve_scenario
