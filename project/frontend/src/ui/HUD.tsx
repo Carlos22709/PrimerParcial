@@ -41,7 +41,9 @@ export function LeftPanel() {
               style={{
                 width: `${pct}%`,
                 background:
-                  pct > 40 ? 'linear-gradient(90deg,#22d3ee,#06b6d4)' : 'linear-gradient(90deg,#f87171,#ef4444)',
+                  pct > 40
+                    ? 'linear-gradient(90deg,#10b981,#14b8d4,#2563eb)'
+                    : 'linear-gradient(90deg,#f97316,#ef4444,#ec4899)',
               }}
             />
           </div>
@@ -147,7 +149,7 @@ export function BottomControls({
   return (
     <footer className="hud-bottom">
       <button className="btn btn-primary" onClick={onExecute} disabled={running}>
-        ▶ EXECUTE PLAN
+        EXECUTE PLAN
       </button>
       <button
         className="btn btn-secondary"
@@ -156,7 +158,7 @@ export function BottomControls({
           onReset()
         }}
       >
-        ↺ RESET
+        RESET
       </button>
       <label className="speed-control">
         SPEED
@@ -171,7 +173,7 @@ export function BottomControls({
         <span>{speed.toFixed(2)}x</span>
       </label>
       <div className="zone-badge">
-        ZONE <strong>{zone}</strong> · {zoneName}
+        ZONE <strong>{zone}</strong> / {zoneName}
       </div>
     </footer>
   )

@@ -14,27 +14,27 @@ import {
   ToolVoxel,
 } from './Entities'
 
-/** Corridor MOVE cost → distinct floor tint (not a muddy warm blend). */
+/** Corridor MOVE cost -> distinct floor tint. */
 export function costToFloorColor(cost: number): string {
-  // Discrete palette keyed by known corridor costs — high contrast.
+  // Discrete palette keyed by known corridor costs.
   const palette: Record<number, string> = {
-    3: '#7dd3fc', // sky — cheapest
+    3: '#7dd3fc', // sky, cheapest
     4: '#86efac', // green
     5: '#fde047', // yellow
     6: '#fdba74', // orange
     8: '#f472b6', // pink
-    12: '#c084fc', // violet — expensive alternate
+    12: '#c084fc', // violet, expensive alternate
     14: '#a78bfa',
   }
   if (palette[cost]) return palette[cost]
 
-  // Fallback for any other cost: map 1..20 onto a clear hue wheel (cyan→red)
+  // Fallback for any other cost: map 1..20 onto a clear hue wheel.
   const t = Math.min(1, Math.max(0, (cost - 1) / 19))
-  const hue = 190 - t * 190 // 190 cyan → 0 red
-  return `hsl(${hue} 75% 65%)`
+  const hue = 190 - t * 190
+  return `hsl(${hue} 82% 64%)`
 }
 
-const ROOM_FLOOR = '#e8edf2'
+const ROOM_FLOOR = '#f4f7fb'
 
 function buildCellCostMap(scenario: Scenario): Map<string, number> {
   const map = new Map<string, number>()
@@ -59,7 +59,7 @@ function buildCellCostMap(scenario: Scenario): Map<string, number> {
   }
 
   // Second pass: cells exclusive to the expensive alternate keep that cost.
-  // (Already handled by min — exclusive spine cells only appear on Z2-Z5.)
+  // Already handled by min; exclusive spine cells only appear on Z2-Z5.
   return map
 }
 
@@ -92,7 +92,7 @@ function Floors() {
       {tiles.map((t) => (
         <mesh key={t.key} position={[t.x, -0.05, t.z]}>
           <boxGeometry args={[t.cs * 0.98, 0.1, t.cs * 0.98]} />
-          <meshStandardMaterial color={t.color} roughness={0.85} />
+          <meshStandardMaterial color={t.color} roughness={0.62} metalness={0.04} />
         </mesh>
       ))}
     </group>
@@ -107,7 +107,7 @@ function Walls() {
       {walls.map((w, i) => (
         <mesh key={i} position={[w.x, w.y, w.z]}>
           <boxGeometry args={[w.w, w.h, w.d]} />
-          <meshStandardMaterial color="#c5ccd6" roughness={0.65} />
+          <meshStandardMaterial color="#d7dce8" roughness={0.55} metalness={0.05} />
         </mesh>
       ))}
     </group>
@@ -125,7 +125,7 @@ function ZoneMarkers() {
         return (
           <mesh key={z.id} position={[c[0], 0.02, c[2]]} rotation={[-Math.PI / 2, 0, 0]}>
             <circleGeometry args={[0.3, 16]} />
-            <meshBasicMaterial color="#94a3b8" transparent opacity={0.3} />
+            <meshBasicMaterial color="#2563eb" transparent opacity={0.22} />
           </mesh>
         )
       })}
@@ -139,10 +139,11 @@ export function World() {
 
   return (
     <>
-      <color attach="background" args={['#dbe4ee']} />
-      <ambientLight intensity={0.85} />
-      <directionalLight position={[14, 20, 10]} intensity={0.9} />
-      <hemisphereLight args={['#f8fafc', '#94a3b8', 0.4]} />
+      <color attach="background" args={['#eef7ff']} />
+      <ambientLight intensity={0.98} />
+      <directionalLight position={[14, 20, 10]} intensity={1.1} color="#fff7ed" />
+      <directionalLight position={[-10, 8, -8]} intensity={0.32} color="#f0abfc" />
+      <hemisphereLight args={['#f8fafc', '#93c5fd', 0.56]} />
 
       <Floors />
       <Walls />

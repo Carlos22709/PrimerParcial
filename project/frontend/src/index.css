@@ -1,7 +1,11 @@
 :root {
-  color-scheme: dark;
-  font-family: 'JetBrains Mono', ui-monospace, monospace;
-  background: #0b1220;
+  color-scheme: light;
+  font-family: 'JetBrains Mono', 'Segoe UI', ui-monospace, monospace;
+  font-synthesis: none;
+  text-rendering: geometricPrecision;
+  background: #eef7ff;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 * {
@@ -15,5 +19,10 @@ body,
   width: 100%;
   height: 100%;
   overflow: hidden;
-  background: #0b1220;
+  background: #eef7ff;
+}
+
+button,
+input {
+  font: inherit;
 }

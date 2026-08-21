@@ -25,18 +25,18 @@ export default function App() {
     try {
       setError(null)
       reset()
-      appendLog({ text: '[---] Requesting plan from /api/solve ...', level: 'info' })
+      appendLog({ text: '[AI] Requesting plan from /api/solve ...', level: 'info' })
       const response = await fetchPlan(scenario)
       setPlan(response)
       if (!response.solution_found) {
         appendLog({
-          text: `[---] FAILURE: ${response.message ?? 'no solution'}`,
+          text: `[AI] FAILURE: ${response.message ?? 'no solution'}`,
           level: 'error',
         })
         return
       }
       appendLog({
-        text: `[---] Plan received — ${response.steps.length} steps, cost ${response.total_cost}`,
+        text: `[AI] Plan received - ${response.steps.length} steps, cost ${response.total_cost}`,
         level: 'ok',
       })
       // small delay so reset state settles, then run
@@ -45,7 +45,7 @@ export default function App() {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       setError(msg)
-      appendLog({ text: `[---] API ERROR: ${msg}`, level: 'error' })
+      appendLog({ text: `[AI] API ERROR: ${msg}`, level: 'error' })
     }
   }
 
